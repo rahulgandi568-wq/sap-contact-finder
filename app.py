@@ -9,13 +9,54 @@ Run:
     python app.py
 Then open http://localhost:8000
 """
-import re, html, concurrent.futures as cf
+import re, html, os, base64, time, ssl, smtplib, concurrent.futures as cf
+from email.message import EmailMessage
 from flask import Flask, request, jsonify, render_template_string
 import requests
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 HEADERS = {"User-Agent": "Mozilla/5.0 (SAP-contact-finder; personal use)"}
+
+# ---------------- email sender config (set these as env vars on the server) ----
+GMAIL_USER         = os.environ.get("GMAIL_USER", "")          # the Gmail you send FROM
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")  # 16-char Google App Password
+# TEST_MODE on by default -> every email goes to TEST_EMAIL, never the real recruiter.
+TEST_MODE  = os.environ.get("TEST_MODE", "1").lower() not in ("0", "false", "no", "off")
+TEST_EMAIL = os.environ.get("TEST_EMAIL", "sg.sumagandham@gmail.com")
+
+@app.after_request
+def _cors(resp):
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    return resp
+
+def fill_tpl(s, j):
+    return (s or "") \
+        .replace("{recruiter}", j.get("recruiter") or j.get("name") or "there") \
+        .replace("{role}",      j.get("role") or j.get("title") or "your SAP requirement") \
+        .replace("{company}",   j.get("company") or "your client") \
+        .replace("{module}",    j.get("module") or "SAP")
+
+def send_one(to_addr, subject, body, resume_b64, resume_name):
+    msg = EmailMessage()
+    msg["From"] = GMAIL_USER
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+    if resume_b64:
+        try:
+            raw = base64.b64decode(resume_b64.split(",")[-1])
+            sub = "pdf" if (resume_name or "").lower().endswith(".pdf") else "octet-stream"
+            msg.add_attachment(raw, maintype="application", subtype=sub,
+                               filename=resume_name or "resume.pdf")
+        except Exception:
+            pass
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=30) as s:
+        s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        s.send_message(msg)
 
 # ---------------- module detection ----------------
 MODULES = [
@@ -267,6 +308,49 @@ def index():
 def api_search():
     resume = (request.get_json(force=True) or {}).get("resume","")
     return jsonify(find_jobs_with_contacts(resume))
+
+@app.route("/api/config", methods=["GET"])
+def api_config():
+    # Lets the front-end show whether sending is wired up (never returns the secret).
+    return jsonify({"ready": bool(GMAIL_USER and GMAIL_APP_PASSWORD),
+                    "test_mode": TEST_MODE, "test_email": TEST_EMAIL,
+                    "from": GMAIL_USER if GMAIL_USER else ""})
+
+@app.route("/api/send", methods=["POST", "OPTIONS"])
+def api_send():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not (GMAIL_USER and GMAIL_APP_PASSWORD):
+        return jsonify({"ok": False,
+            "error": "Sender not configured. Set GMAIL_USER and GMAIL_APP_PASSWORD env vars on the server."}), 400
+    data        = request.get_json(force=True) or {}
+    jobs        = data.get("jobs") or []
+    threshold   = float(data.get("threshold", 75))
+    subject_tpl = data.get("subject", "SAP {module} - {role} - available C2C")
+    body_tpl    = data.get("body", "")
+    resume_b64  = data.get("resume_b64", "")
+    resume_name = data.get("resume_name", "resume.pdf")
+    delay       = min(float(data.get("delay", 5)), 10)
+
+    targets = [j for j in jobs if j.get("email") and float(j.get("match", 0)) >= threshold]
+    results = []
+    for i, j in enumerate(targets):
+        real_to = j["email"]
+        to_addr = TEST_EMAIL if TEST_MODE else real_to
+        subject = fill_tpl(subject_tpl, j)
+        body    = fill_tpl(body_tpl, j)
+        if TEST_MODE:
+            body = f"[TEST MODE - intended recipient: {real_to}]\n\n" + body
+        try:
+            send_one(to_addr, subject, body, resume_b64, resume_name)
+            results.append({"to": real_to, "sent_to": to_addr, "ok": True})
+        except Exception as e:
+            results.append({"to": real_to, "ok": False, "error": str(e)})
+        if i < len(targets) - 1 and delay > 0:
+            time.sleep(delay)
+    return jsonify({"ok": True, "test_mode": TEST_MODE,
+                    "sent": sum(1 for r in results if r["ok"]),
+                    "total": len(targets), "results": results})
 
 if __name__ == "__main__":
     import os
